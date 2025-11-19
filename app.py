@@ -155,6 +155,74 @@ def query_nvd_cpe(search_term, max_results=5):
         print(f"NVD API error: {e}")
         return []
 
+def verify_cpe_exists(cpe_string):
+    """Verify if a specific CPE exists in NVD database using cpeMatchString"""
+    global last_nvd_request
+
+    # Rate limiting
+    elapsed = time.time() - last_nvd_request
+    if elapsed < RATE_LIMIT_DELAY:
+        time.sleep(RATE_LIMIT_DELAY - elapsed)
+
+    url = f"https://services.nvd.nist.gov/rest/json/cpes/2.0"
+    params = {
+        'cpeMatchString': cpe_string,
+        'resultsPerPage': 1
+    }
+
+    headers = {}
+    if NVD_API_KEY:
+        headers['apiKey'] = NVD_API_KEY
+
+    try:
+        last_nvd_request = time.time()
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+
+        if response.status_code == 429:
+            # Rate limited - wait and retry once
+            time.sleep(35)
+            last_nvd_request = time.time()
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+
+        response.raise_for_status()
+        data = response.json()
+
+        # If we get any results, the CPE pattern exists
+        if 'products' in data and len(data['products']) > 0:
+            return True
+
+        return False
+
+    except Exception as e:
+        print(f"CPE verification error: {e}")
+        return False
+
+def verify_and_backoff_version(vendor, product, version):
+    """
+    Verify CPE with version exists, using backoff strategy on version if needed.
+    Returns the verified CPE string or None if no match found.
+    """
+    if not version:
+        return None
+    
+    # Split version by dots
+    version_parts = version.split('.')
+    
+    # Try from full version down to single component
+    for i in range(len(version_parts), 0, -1):
+        test_version = '.'.join(version_parts[:i])
+        cpe_string = f"cpe:2.3:a:{vendor}:{product}:{test_version}:*:*:*:*:*:*:*"
+        
+        print(f"    Verifying: {cpe_string}")
+        
+        if verify_cpe_exists(cpe_string):
+            print(f"    ✓ Verified!")
+            return cpe_string
+    
+    # No version matched
+    print(f"    ✗ No version found for {vendor}:{product}")
+    return None
+
 def backoff_search(app_name):
     """Perform backoff search by removing words from right to left"""
     words = app_name.split()
@@ -213,7 +281,7 @@ If you cannot determine it with high confidence, respond with: UNKNOWN"""
         return None
 
 def lookup_cpe(app_data):
-    """Main CPE lookup logic"""
+    """Main CPE lookup logic with verification"""
     app_name = app_data.get('Name', '')
     publisher = app_data.get('Publisher', '')
     version = app_data.get('Version', '')
@@ -257,67 +325,101 @@ def lookup_cpe(app_data):
     match_method = None
     confidence = 0.0
 
-    # Step 2: Try exact match WITH version first (if version provided)
-    if version:
-        search_with_version = f"{normalized} {version}"
-        print(f"  Trying with version: {search_with_version}")
-        results = query_nvd_cpe(search_with_version, max_results=5)
-
-        if results:
-            result = results[0]
-            matched_name = search_with_version
-            match_method = 'exact'
-            confidence = 0.95
-            print(f"  Found with version!")
-        else:
-            # No results with version, try without
-            print(f"  No results with version, trying without: {normalized}")
-            results = query_nvd_cpe(normalized, max_results=5)
-            if results:
-                # Found generic CPE - inject the actual version
-                result = results[0]
-                cpe_parts = result['cpe'].split(':')
-                if len(cpe_parts) >= 6 and version:
-                    cpe_parts[5] = version  # Replace version field
-                    result['cpe'] = ':'.join(cpe_parts)
-                matched_name = normalized
-                match_method = 'exact_version_injected'
-                confidence = 0.85
-                print(f"  Found without version, injected version")
-    else:
-        # No version provided, search without it
-        print(f"  No version provided, searching: {normalized}")
-        results = query_nvd_cpe(normalized, max_results=5)
-        if results:
-            result = results[0]
-            matched_name = normalized
-            match_method = 'exact'
-            confidence = 0.9
-            print(f"  Found")
-
-    # Step 3: If still no result, try backoff search
-    if not result:
-        print(f"  No exact match, trying backoff search...")
-        result, matched_name = backoff_search(normalized)
-        if result:
-            match_method = 'backoff'
-            confidence = 0.7
-            # Inject version into backoff result if available
+    # Step 2: Search for vendor:product using keyword search
+    print(f"  Searching for: {normalized}")
+    results = query_nvd_cpe(normalized, max_results=5)
+    
+    if results:
+        # Got a vendor:product match
+        candidate = results[0]
+        vendor = candidate['vendor']
+        product = candidate['product']
+        
+        print(f"  Found vendor:product = {vendor}:{product}")
+        
+        # Step 3: Verify the vendor:product exists
+        verify_pattern = f"cpe:2.3:a:{vendor}:{product}:*:*:*:*:*:*:*:*"
+        print(f"  Verifying vendor:product exists...")
+        
+        if verify_cpe_exists(verify_pattern):
+            print(f"  ✓ Vendor:product verified!")
+            
+            # Step 4: If we have a version, try to verify it with backoff
             if version:
-                cpe_parts = result['cpe'].split(':')
-                if len(cpe_parts) >= 6:
-                    cpe_parts[5] = version
-                    result['cpe'] = ':'.join(cpe_parts)
-                    match_method = 'backoff_version_injected'
-
-    # Step 4: If still no result, try LLM as last resort
-    if not result:
-        print("  Trying LLM fallback...")
-        result = llm_cpe_lookup(app_name, publisher)
-        matched_name = None
-        if result:
-            match_method = 'llm'
-            confidence = 0.5
+                print(f"  Attempting version verification with backoff...")
+                verified_cpe = verify_and_backoff_version(vendor, product, version)
+                
+                if verified_cpe:
+                    # Success! We verified a version
+                    result = {
+                        'cpe': verified_cpe,
+                        'vendor': vendor,
+                        'product': product
+                    }
+                    matched_name = normalized
+                    match_method = 'verified_with_version'
+                    confidence = 0.95
+                    print(f"  ✓ Version verified: {verified_cpe}")
+                else:
+                    # Could not verify any version - return nothing per requirements
+                    print(f"  ✗ No verifiable version found - returning not_found")
+                    result = None
+                    match_method = 'version_not_found'
+                    confidence = 0.0
+            else:
+                # No version provided, just return the base vendor:product
+                # But we won't include it since user wants version or nothing
+                print(f"  No version provided - cannot return CPE without version")
+                result = None
+                match_method = 'no_version_provided'
+                confidence = 0.0
+        else:
+            print(f"  ✗ Vendor:product verification failed")
+            result = None
+            match_method = 'verification_failed'
+            confidence = 0.0
+    else:
+        print(f"  No initial match found")
+        
+        # Step 5: Try backoff search
+        print(f"  Trying backoff search...")
+        candidate, matched_name = backoff_search(normalized)
+        
+        if candidate:
+            vendor = candidate['vendor']
+            product = candidate['product']
+            print(f"  Backoff found: {vendor}:{product}")
+            
+            # Verify this vendor:product
+            verify_pattern = f"cpe:2.3:a:{vendor}:{product}:*:*:*:*:*:*:*:*"
+            if verify_cpe_exists(verify_pattern):
+                print(f"  ✓ Backoff vendor:product verified!")
+                
+                # Try version verification if we have one
+                if version:
+                    verified_cpe = verify_and_backoff_version(vendor, product, version)
+                    if verified_cpe:
+                        result = {
+                            'cpe': verified_cpe,
+                            'vendor': vendor,
+                            'product': product
+                        }
+                        match_method = 'backoff_verified_with_version'
+                        confidence = 0.80
+                    else:
+                        # Backoff match but no verifiable version
+                        result = None
+                        match_method = 'backoff_version_not_found'
+                        confidence = 0.0
+                else:
+                    result = None
+                    match_method = 'backoff_no_version_provided'
+                    confidence = 0.0
+            else:
+                print(f"  ✗ Backoff verification failed")
+                result = None
+                match_method = 'backoff_verification_failed'
+                confidence = 0.0
 
     # Save to database (even if no result found)
     with get_db() as conn:
@@ -335,13 +437,13 @@ def lookup_cpe(app_data):
             result['cpe'] if result else None,
             result['vendor'] if result else None,
             result['product'] if result else None,
-            match_method if result else 'not_found',
-            confidence if result else 0.0
+            match_method if match_method else 'not_found',
+            confidence
         ))
         conn.commit()
 
     if result:
-        print(f"  Found: {result['cpe']}")
+        print(f"  ✓ Final result: {result['cpe']}")
         return {
             'cpe': result['cpe'],
             'vendor': result['vendor'],
@@ -351,12 +453,12 @@ def lookup_cpe(app_data):
             'cached': False
         }
     else:
-        print(f"  Not found")
+        print(f"  ✗ Not found")
         return {
             'cpe': None,
             'vendor': None,
             'product': None,
-            'match_method': 'not_found',
+            'match_method': match_method if match_method else 'not_found',
             'cached': False
         }
 
